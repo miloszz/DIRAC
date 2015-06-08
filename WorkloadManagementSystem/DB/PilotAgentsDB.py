@@ -19,6 +19,7 @@
     getPilotsSummary()
 
 """
+from pilot_client import resp
 
 __RCSID__ = "$Id$"
 
@@ -35,9 +36,10 @@ from sqlalchemy.sql.schema import ForeignKey, PrimaryKeyConstraint
 from sqlalchemy.sql.sqltypes import DateTime
 from sqlalchemy.orm import session, sessionmaker, scoped_session, mapper
 from sqlalchemy.engine.reflection import Inspector
-from sqlalchemy import create_engine, Table, Column, MetaData, Integer, String
+from sqlalchemy import create_engine, Table, Column, MetaData, Integer, String, Binary, Enum, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.mysql import INTEGER, DOUBLE, MEDIUMBLOB
 
 import datetime
 import time
@@ -59,6 +61,27 @@ class PilotAgentsDB( DB ):
     resp = self.__initializeDB()
     if not resp['OK']:
       raise Exception("Couldn't create tables: " + resp['Message'])
+  
+##########################################################################################
+  def sessionAdd(self, session, obj):
+    
+    try:
+      session.add(obj)
+    except Exception, e:
+      session.rollback()
+      session.close()
+      return S_ERROR("Couldn't add to session: " + e.message)
+    return S_OK()
+  
+##########################################################################################
+  def sessionCommit(self, session):
+    
+    try:
+      session.commit()
+    except Exception, e:
+      session.rollback()
+      session.close()
+      return S_ERROR("Couln't commit session: " + e.message)
   
 ##########################################################################################
   def __initializeConnection(self, dbPath):
@@ -98,19 +121,13 @@ class PilotAgentsDB( DB ):
     session = self.sqlalchemySession()
     logging = PilotsLogging(pilotUUID, status, minorStatus, timeStamp, source)
     
-    try:
-      session.add(logging)
-    except Exception, e:
-      session.rollback()
-      session.close()
-      return S_ERROR("Failed to add PilotsLogging: " + e.message)
+    resp = self.sessionAdd(session, logging)
+    if not resp['OK']:
+      return resp
     
-    try:
-      session.commit()
-    except Exception, e:
-      session.rollback()
-      session.close()
-      return S_ERROR("Failed to commit PilotsLogging: " + e.message)
+    resp = self.sessionCommit(session)
+    if not resp['OK']:
+      return resp
     
     return S_OK()
 
@@ -218,6 +235,25 @@ class PilotAgentsDB( DB ):
     return S_OK()
 
 ##########################################################################################
+  def _addPilotTQReference( self, pilotRef, taskQueueID, ownerDN, ownerGroup, broker = 'Unknown',
+                        gridType = 'DIRAC', requirements = 'Unknown', pilotStampDict = {} ):
+    """ Add a new pilot job reference """
+    
+    err = 'PilotAgentsDB.addPilotTQReference: Failed to retrieve a new Id.'
+
+    result = self._escapeString( requirements )
+    if not result['OK']:
+      gLogger.warn( 'Failed to escape requirements string' )
+    e_requirements = result['Value']
+    
+    for ref in pilotRef:
+      stamp = ''
+      if ref in pilotStampDict:
+        stamp = pilotStampDict[ref]
+        
+        pilotTQReference = PilotAgents(ref, int( taskQueueID ), ownerDN, ownerGroup, broker, gridType, stamp)
+        
+
   def addPilotTQReference( self, pilotRef, taskQueueID, ownerDN, ownerGroup, broker = 'Unknown',
                         gridType = 'DIRAC', requirements = 'Unknown', pilotStampDict = {} ):
     """ Add a new pilot job reference """
@@ -1287,3 +1323,95 @@ class PilotsUUIDtoID( Base ):
   def __init__(self, pilotUUID, pilotID = None):
     self.pilotUUID = pilotUUID
     self.pilotID = pilotID
+
+class PilotAgents( Base ):
+  
+  __tablename__ = 'PilotAgents'
+  __table_args__ = {
+                    'mysql_engine': 'InnoDB',
+                    'mysql_charset': 'latin1' # ???
+                    }
+  
+  pilotID = Column( 'PilotID', INTEGER(unsigned=True), primary_key = True, autoincrement = True )
+  initialJobID = Column( 'InitialJobID', INTEGER(unsigned=True), default = 0, nullable = False )
+  currentJobID = Column( 'CurrentJobID', INTEGER(unsigned=True), default = 0, nullable = False )
+  taskQueueID = Column( 'TaskQueueID', INTEGER(unsigned=True), default = 0, nullable = False )
+  pilotJobReference = Column( 'PilotJobReference', String(255), index = True, default = 'Unknown', nullable = False )
+  pilotStamp = Column( 'PilotStamp', String(32), default = '', nullable = False )
+  destinationSite = Column( 'DestinationSite', String(128), default = 'NotAssigned', nullable = False )
+  queue = Column( 'Queue', String(128), default = 'Unknown', nullable = False )
+  gridSite = Column( 'GridSite', String(128), default = 'Unknown', nullable = False )
+  broker = Column( 'Broker', String(128), default = 'Unknown', nullable = False )
+  ownerDN = Column( 'OwnerDN', String(255), nullable = False )
+  ownerGroup = Column( 'OwnerGroup', String(128), nullable = False )
+  gridType = Column( 'GridType', String(32), default = 'Unknown', nullable = False )
+  gridRequirements = Column( 'GridRequirements', Binary )
+  benchMark = Column( 'BenchMark', DOUBLE(), default = 0.0, nullable = False )
+  submissionTime = Column( 'SubmissionTime', DateTime, nullable = True )
+  lastUpdateTime = Column( 'LastUpdateTime', DateTime, nullable = True )
+  status = Column( 'Status', String(32), index = True, default = 'Unknown', nullable = False )
+  statusReason = Column( 'StatusReason', String(255), default = 'Unknown', nullable = False )
+  parentID = Column( 'ParentID', INTEGER(unsigned=True), default = 0, nullable = False )
+  outputReady = Column( 'OutputReady', Enum('True', 'False'), default = 'False', nullable = False )
+  accountingSent = Column( 'AccountingSent', Enum('True', 'False'), default = 'False', nullable = False )
+  statuskey = Index( 'Statuskey', gridSite, destinationSite, status )
+  
+  def __init__( self, pilotRef, taskQueueID, ownerDN, ownerGroup, broker = 'Unknown', gridType = 'DIRAC', requirements = 'Unknown', 
+                pilotStamp = '', initialJobID = 0, currentJobID = 0, destinationSite = 'NotAssigned', queue = 'Unknown', 
+                gridSite = 'Unknown', benchMark = 0.0, submissionTime = None, lastUpdateTime = None, status = 'Unknown', 
+                statusReason = 'Unknown', parentID = 0, outputReady = 'False', accountingSent = 'False' ):
+    
+    self.initialJobID = initialJobID
+    self.currentJobID = currentJobID
+    self.taskQueueID = taskQueueID
+    self.pilotJobReference = pilotRef
+    self.pilotStamp = pilotStamp
+    self.destinationSite = destinationSite
+    self.queue = queue
+    self.gridSite = gridSite
+    self.broker = broker
+    self.ownerDN = ownerDN
+    self.ownerGroup = ownerGroup
+    self.gridType = gridType
+    self.gridRequirements = requirements
+    self.benchMark = benchMark
+    self.submissionTime = submissionTime
+    self.lastUpdateTime = lastUpdateTime
+    self.status = status
+    self.statusReason = statusReason
+    self.parentID = parentID
+    self.outputReady = outputReady
+    self.accountingSent = accountingSent
+  
+class JobToPilotMapping( Base ):
+  
+  __tablename__ = 'JobToPilotMapping'
+  __table_args__ = {
+                    'mysql_engine': 'InnoDB',
+                    'mysql_charset': 'latin1' # ???
+                    }
+  pilotID = Column( 'PilotID', INTEGER(unsigned=True), index = True, nullable = False )
+  jobID = Column( 'JobID', INTEGER(unsigned=True), index = True, nullable = False )
+  startTime = Column( 'StartTime', DateTime, nullable = False )
+  
+class PilotOutput( Base ):
+  
+  __tablename__ = 'PilotOutput'
+  __table_args__ = {
+                    'mysql_engine': 'InnoDB',
+                    'mysql_charset': 'latin1' # ???
+                    }
+  pilotID = Column( 'PilotID', INTEGER(unsigned=True), primary_key = True, nullable = False )
+  stdOutput = Column( 'StdOutput', MEDIUMBLOB() )
+  stdError = Column( 'StdError', MEDIUMBLOB() )
+  
+class PilotRequirements( Base ):
+  
+  __tablename__ = 'PilotRequirements'
+  __table_args__ = {
+                    'mysql_engine': 'InnoDB',
+                    'mysql_charset': 'latin1' # ???
+                    }
+  pilotID = Column( 'PilotID', INTEGER(unsigned=True), primary_key = True, nullable = False )
+  requirements = Column( 'Requirements', Binary )
+  
